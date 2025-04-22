@@ -1,0 +1,151 @@
+---
+title: "Calcium Image Analysis"
+author: "Dieter Henrik Heiland"
+date: "2024-10-10"
+output: pdf_document
+---
+
+```{r}
+# Set the Python environment used by reticulate
+reticulate::use_condaenv("CaImg")
+```
+
+## Step 1: Map pixel coordinates to segmented cell geometries
+```{r}
+library(sf)
+library(ggplot2)
+library(jsonlite)
+library(tidyverse)
+
+# Load and filter GeoJSON file of cell segmentation
+geojson_file <- "./your/path/segmentation.geojson"
+geojson_data <- st_read(geojson_file)
+
+df <- st_as_sf(geojson_data) %>%
+  as.data.frame() %>%
+  filter(objectType == "cell") %>%
+  select(id, geometry) %>%
+  mutate(id = paste0("Cell_", 1:nrow(.)))
+
+# Load calcium image
+img_path <- "./your/path/image.tif"
+img <- EBImage::readImage(img_path)
+plot(img)
+
+# Extract polygon coordinates from segmentation
+coords_all <- st_coordinates(df$geometry) %>%
+  as.data.frame() %>%
+  mutate(ID = paste0("Cell_", L2), id = L2)
+
+# Melt image into pixel intensity DataFrame
+data_px <- reshape2::melt(img)
+names(data_px)[1:2] <- c("x", "y")
+data_px$pixel <- paste0(1:nrow(data_px))
+
+# Plot segmentation overlay
+ggplot() +
+  geom_raster(data = data_px, aes(x = x, y = y, fill = value)) +
+  scale_fill_viridis_c(option = "inferno", limits = c(0, 0.8), oob = scales::squish) +
+  geom_polygon(data = coords_all, aes(x = X, y = Y, group = ID), color = "white", alpha = 0.5, size = 0.1) +
+  theme_bw() +
+  coord_equal()
+
+# Assign pixels to cells
+points_sf <- st_as_sf(data_px, coords = c("x", "y"), crs = NA)
+polygons_wkt <- df$geometry
+polygons_sf <- st_as_sf(data.frame(id = 1:length(polygons_wkt), wkt = polygons_wkt), crs = NA)
+joined <- st_join(points_sf, polygons_sf)
+
+# Summarize assigned pixels per cell
+summarized <- joined %>%
+  as.data.frame() %>%
+  select(value, pixel, id) %>%
+  group_by(id) %>%
+  summarize(nested = list(pixel)) %>%
+  mutate(nr_px = map_int(nested, length))
+
+list_pixels <- map(1:nrow(summarized), ~ summarized$nested[[.x]])
+all_relevant <- unique(unlist(list_pixels))
+length_summary <- summarized$nr_px
+nrow(summarized)
+```
+
+## Step 2: Process video and compute signal traces per cell
+```{python}
+# Python processing pipeline: load video, extract frame intensities per cell
+import cv2
+import matplotlib.pyplot as plt
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from numba import jit, prange
+from joblib import Parallel, delayed
+
+# Load R-mapped data
+list_pixels = r.list_pixels
+all_relevant = np.asarray(r.all_relevant).astype(str)
+
+# Map pixels to integer IDs
+unique_pixels = sorted(set(pixel for cell in list_pixels for pixel in cell))
+pixel_to_int_id = {pixel: idx for idx, pixel in enumerate(unique_pixels)}
+int_list_pixels = [[pixel_to_int_id[pixel] for pixel in cell] for cell in list_pixels]
+pixel_array = np.array([px for cell in int_list_pixels for px in cell])
+cell_array = np.array([idx for idx, cell in enumerate(int_list_pixels) for _ in cell])
+
+# JIT-compiled function to sum pixel intensities per cell
+@jit(nopython=True, parallel=True)
+def map_pixels_to_cells_parallel(pixel_array, cell_array, gene_pixels, gene_values, num_cells):
+    cell_intensities = np.zeros(num_cells)
+    for i in prange(len(gene_pixels)):
+        for j in range(len(pixel_array)):
+            if gene_pixels[i] == pixel_array[j]:
+                cell_idx = cell_array[j]
+                cell_intensities[cell_idx] += gene_values[i]
+                break
+    return cell_intensities
+
+def process_gene_file(img, pixel_array, cell_array, pixel_to_int_id, list_pixels):
+    data_px = pd.DataFrame(img).T.melt()
+    data_px['pixel'] = [str(i) for i in range(1, len(data_px)+1)]
+    gene_df = data_px[data_px['pixel'].isin(all_relevant)]
+    gene_pixels = gene_df['pixel'].map(pixel_to_int_id).dropna().astype(int).values
+    gene_values = gene_df['value'].values
+    return map_pixels_to_cells_parallel(pixel_array, cell_array, gene_pixels, gene_values, len(list_pixels))
+
+# Load and process video
+video_path = "./your/path/video.avi"
+cap = cv2.VideoCapture(video_path)
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+intensity_over_time = {i: [] for i in range(len(list_pixels))}
+
+for frame_idx in tqdm(range(total_frames), desc="Processing video frames"):
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) / 255.0
+    img = frame_gray[:, :, 0]
+    mean_intensities = process_gene_file(img, pixel_array, cell_array, pixel_to_int_id, list_pixels)
+    for i, intensity in enumerate(mean_intensities):
+        intensity_over_time[i].append(float(intensity))
+cap.release()
+```
+
+## Step 3: Save output as CSV for downstream analysis
+```{python}
+import pandas as pd
+
+frame_rate = 6.0
+num_frames = len(next(iter(intensity_over_time.values())))
+time_points = [i / frame_rate for i in range(num_frames)]
+
+# Build DataFrame
+df = pd.DataFrame({'Time': time_points})
+for cell_idx, intensity_values in intensity_over_time.items():
+    df[f'Cell_{cell_idx + 1}'] = intensity_values
+
+# Save results
+output_path = "./your/path/calcium_traces.csv"
+df.to_csv(output_path, index=False)
+print("Saved calcium traces to:", output_path)
+```
